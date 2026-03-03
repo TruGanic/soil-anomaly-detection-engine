@@ -1,25 +1,34 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from pymongo import MongoClient
+from datetime import datetime, timedelta
 import joblib
 import pandas as pd
-import numpy as np
+import os
 
 app = FastAPI()
 
-# 1. Load the Final Model (8 Features)
+# --- 1. LOAD AI MODEL ---
 try:
     model = joblib.load('models/isolation_forest_final.pkl')
     print("✅ Model loaded successfully.")
 except FileNotFoundError:
     print("❌ Error: Model file not found. Run train_model.py first.")
 
-# 2. In-Memory Database to store "Previous Readings"
-# Structure: { "farm_101": { "N": 40, "P": 12, "K": 20, "EC": 1.2 } }
-farm_memory = {}
+# --- 2. MONGODB CONNECTION ---
+from dotenv import load_dotenv
+load_dotenv()
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client['test'] # CHANGE THIS to your actual database name
 
-# 3. Define Input Data Structure (Must match Sensor Data)
+crop_batches_col = db['cropbatches']
+input_logs_col = db['inputlogs']
+soil_readings_col = db['soilreadings'] 
+
+# --- 3. INPUT SCHEMA ---
 class SoilData(BaseModel):
-    farm_id: str
+    sensor_id: str  # Matches the simulator payload exactly
     Nitrogen: float
     Phosphorus: float
     Potassium: float
@@ -27,30 +36,37 @@ class SoilData(BaseModel):
 
 @app.post("/analyze_soil")
 def analyze_soil(data: SoilData):
-    # --- STEP 1: CALCULATE DELTAS (Speed of Change) ---
-    prev_data = farm_memory.get(data.farm_id)
+    # --- STEP 1: VERIFY HARDWARE & GET BATCH ---
+    active_batch = crop_batches_col.find_one({
+        "sensorId": data.sensor_id, 
+        "status": "Active"
+    })
     
-    if prev_data:
-        # Calculate change from last time
-        delta_n = data.Nitrogen - prev_data['N']
-        delta_p = data.Phosphorus - prev_data['P']
-        delta_k = data.Potassium - prev_data['K']
-        delta_ec = data.EC - prev_data['EC']
+    if not active_batch:
+        return {
+            "status": "IDLE", 
+            "organic_score": "N/A", 
+            "reason": "No active crop planted for this sensor."
+        }
         
-        is_first_reading = False
+    current_batch_id = active_batch["batchId"]
+    current_percentage = active_batch.get("currentOrganicLevel", 100)
+
+    # --- STEP 2: CALCULATE TIME-SERIES DELTAS ---
+    prev_reading = soil_readings_col.find_one(
+        {"batchId": current_batch_id},
+        sort=[("createdAt", -1)] 
+    )
+    
+    if prev_reading:
+        delta_n = round(data.Nitrogen - prev_reading['Nitrogen'], 2)
+        delta_p = round(data.Phosphorus - prev_reading['Phosphorus'], 2)
+        delta_k = round(data.Potassium - prev_reading['Potassium'], 2)
+        delta_ec = round(data.EC - prev_reading['EC'], 2)
     else:
-        # First time seeing this farm? Assume no change (Delta = 0)
         delta_n, delta_p, delta_k, delta_ec = 0.0, 0.0, 0.0, 0.0
-        is_first_reading = True
 
-    # Update Memory for next time
-    farm_memory[data.farm_id] = {
-        "N": data.Nitrogen, "P": data.Phosphorus, 
-        "K": data.Potassium, "EC": data.EC
-    }
-
-    # --- STEP 2: PREPARE DATA FOR AI ---
-    # The order MUST match exactly what you used in train_model.py
+    # --- STEP 3: RUN AI ---
     features = [
         'Nitrogen', 'Phosphorus', 'Potassium', 'EC',
         'Delta_N', 'Delta_P', 'Delta_K', 'Delta_EC'
@@ -61,37 +77,64 @@ def analyze_soil(data: SoilData):
         delta_n, delta_p, delta_k, delta_ec
     ]], columns=features)
 
-    # --- STEP 3: PREDICT ---
     try:
-        # -1 = Anomaly, 1 = Normal
         prediction = model.predict(input_df)[0]
-        confidence = model.decision_function(input_df)[0]
-        
-        is_anomaly = (prediction == -1)
-        
-        # Grading Logic (Simple Credit Score)
-        # Start with 100. Subtract points for anomalies or high EC.
-        score = 100
-        if is_anomaly: score -= 40
-        if data.EC > 2.0: score -= 20
-        final_score = max(0, score)
+        confidence_score = model.decision_function(input_df)[0]
+        is_anomaly = bool(prediction == -1)
+
+        # Save CURRENT reading for the next cycle
+        soil_readings_col.insert_one({
+            "batchId": current_batch_id,
+            "sensorId": data.sensor_id,
+            "Nitrogen": data.Nitrogen,
+            "Phosphorus": data.Phosphorus,
+            "Potassium": data.Potassium,
+            "EC": data.EC,
+            "isAnomaly": is_anomaly, # Save this to easily count violations later
+            "createdAt": datetime.utcnow()
+        })
+
+        # --- STEP 4: ZERO-TRUST CROSS-CHECKING ---
+        if is_anomaly:
+            forty_eight_hours_ago = datetime.utcnow() - timedelta(hours=48)
+            recent_logs = list(input_logs_col.find({
+                "batchId": current_batch_id,
+                "date": {"$gte": forty_eight_hours_ago}
+            }))
+
+            if confidence_score < -0.15:
+                penalty = 20
+                reason = "Severe unexplained chemical spike detected."
+            elif confidence_score < -0.05:
+                penalty = 10
+                reason = "Moderate unexplained nutrient spike detected."
+            else:
+                penalty = 5
+                reason = "Minor irregular nutrient pattern detected."
+
+            if any(log.get('inputCategory') == 'Organic Fertilizer' for log in recent_logs):
+                reason += " (Zero-Trust Alert: Spike contradicts recent 'Organic Fertilizer' log)"
+
+            new_percentage = max(0, current_percentage - penalty)
+            crop_batches_col.update_one(
+                {"batchId": current_batch_id},
+                {"$set": {
+                    "currentOrganicLevel": new_percentage,
+                    "updatedAt": datetime.utcnow()
+                }}
+            )
+
+            return {
+                "status": "CRITICAL ANOMALY",
+                "organic_score": new_percentage,
+                "reason": reason
+            }
 
         return {
-            "farm_id": data.farm_id,
-            "status": "CRITICAL ANOMALY" if is_anomaly else "COMPLIANT",
-            "organic_score": final_score,
-            "details": {
-                "is_first_reading": is_first_reading,
-                "anomalies_found": is_anomaly,
-                "confidence_score": round(confidence, 4) # Lower/Negative is worse
-            },
-            "sensor_summary": {
-                "Nitrogen": f"{data.Nitrogen} (Change: {round(delta_n, 2)})",
-                "EC": f"{data.EC} (Change: {round(delta_ec, 2)})"
-            }
+            "status": "COMPLIANT",
+            "organic_score": current_percentage,
+            "reason": "Normal expected soil behavior."
         }
 
     except Exception as e:
-        return {"error": str(e)}
-
-# To Run: uvicorn src.main:app --reload
+        raise HTTPException(status_code=500, detail=str(e))
