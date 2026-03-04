@@ -25,6 +25,7 @@ db = client['test'] # CHANGE THIS to your actual database name
 crop_batches_col = db['cropbatches']
 input_logs_col = db['inputlogs']
 soil_readings_col = db['soilreadings'] 
+anomalies_col = db['anomalies']
 
 # --- 3. INPUT SCHEMA ---
 class SoilData(BaseModel):
@@ -102,33 +103,77 @@ def analyze_soil(data: SoilData):
                 "date": {"$gte": forty_eight_hours_ago}
             }))
 
+            # 1. Determine the Base Penalty & Sensor UI Text
             if confidence_score < -0.15:
                 penalty = 20
-                reason = "Severe unexplained chemical spike detected."
+                sensor_insight = f"Severe NPK/EC Spike (Rapid Release)"
             elif confidence_score < -0.05:
                 penalty = 10
-                reason = "Moderate unexplained nutrient spike detected."
+                sensor_insight = f"Moderate nutrient fluctuation"
             else:
                 penalty = 5
-                reason = "Minor irregular nutrient pattern detected."
+                sensor_insight = "Minor irregular nutrient pattern"
 
-            if any(log.get('inputCategory') == 'Organic Fertilizer' for log in recent_logs):
-                reason += " (Zero-Trust Alert: Spike contradicts recent 'Organic Fertilizer' log)"
+            # 2. Format the Farmer Log UI Text & Verdict
+            if len(recent_logs) == 0:
+                farmer_log_insight = "No inputs recorded in last 48 hours"
+                ui_verdict = "UNEXPLAINED SPIKE"
+            else:
+                # The farmer logged SOMETHING. Let's find the unique categories.
+                logged_categories = list(set(log.get('inputCategory', 'Unknown') for log in recent_logs))
+                
+                if 'Organic Fertilizer' in logged_categories:
+                    farmer_log_insight = "Recent 'Organic Fertilizer' log contradicts sensor"
+                    ui_verdict = "DATA MISMATCH" # Matches your UI strictly
+                else:
+                    # They logged something else (like Pesticide), which doesn't explain an NPK spike
+                    categories_str = ", ".join(logged_categories)
+                    farmer_log_insight = f"Logged '{categories_str}' does not explain NPK spike"
+                    ui_verdict = "UNEXPLAINED SPIKE"
 
             new_percentage = max(0, current_percentage - penalty)
+            current_time = datetime.utcnow()
+
+            # 3. Update the Crop Batch (Including the Dashboard 'lastSync' heartbeat)
             crop_batches_col.update_one(
                 {"batchId": current_batch_id},
                 {"$set": {
                     "currentOrganicLevel": new_percentage,
-                    "updatedAt": datetime.utcnow()
+                    "lastSensorSync": current_time,
+                    "updatedAt": current_time
                 }}
             )
+
+            # 4. Generate the exact Incident Report for your Inspection UI
+            ui_confidence = min(99, int(abs(confidence_score) * 600)) 
+            substance = "Synthetic Nitrogen" if delta_n > delta_p and delta_n > delta_k else "Synthetic Fertilizer"
+
+            anomalies_col.insert_one({
+                "batchId": current_batch_id,
+                "sensorId": data.sensor_id,
+                "confidence": ui_confidence,           # Feeds the "98%" text
+                "substance": substance,                # Feeds "Synthetic Nitrogen" text
+                "sensorInsight": sensor_insight,       # Feeds "Sensor Data" text
+                "farmerLogInsight": farmer_log_insight,# Feeds "Farmer Log" text
+                "verdict": ui_verdict,                 # Feeds the orange "VERDICT" box
+                "status": "CRITICAL_ALERT",            # Feeds your Dashboard filter logic
+                "createdAt": current_time
+            })
 
             return {
                 "status": "CRITICAL ANOMALY",
                 "organic_score": new_percentage,
-                "reason": reason
+                "reason": f"{sensor_insight} - {ui_verdict}"
             }
+
+        # --- STEP 5: NORMAL OPERATION (COMPLIANT) ---
+        # Ensure 'lastSync' updates even when soil is healthy
+        crop_batches_col.update_one(
+            {"batchId": current_batch_id},
+            {"$set": {
+                "lastSensorSync": datetime.utcnow() 
+            }}
+        )
 
         return {
             "status": "COMPLIANT",
